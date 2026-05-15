@@ -38,12 +38,37 @@ def node_fetch_pr(state: ReviewState) -> dict:
     return {"pr_title": pr.title, "pr_diff": pr.diff, "pr_files": pr.files_changed, "pr_head_sha": pr.head_sha}
 
 
+_SYSTEM_PROMPT = (
+    "You are a senior code reviewer. Read the PR diff and produce a structured "
+    "review. Be specific (cite file + line where possible).\n\n"
+    "CONFIDENCE CALIBRATION — be honest, do NOT default to high:\n"
+    "  • 0.80–0.95  Mechanical / very safe — typo, dep bump, doc-only, "
+    "formatting, pure rename.\n"
+    "  • 0.62–0.70  Small feature or schema addition with ONE or TWO minor "
+    "open questions (intent, naming, migration order, missing test for one "
+    "helper). No security or data-loss concerns. Use this band when nothing "
+    "is broken but a human eye would help.\n"
+    "  • 0.30–0.55  ANY of: security-sensitive code (auth, crypto, MD5/SHA1 "
+    "for passwords), SQL/string-built queries, plaintext token storage, "
+    "network sync to external URLs, hard-coded user/account ids, no tests "
+    "for new non-trivial logic. Populate `escalation_questions` with 2–4 "
+    "specific questions referencing file:line.\n\n"
+    "Reference points:\n"
+    "  • Adding an optional `--priority` flag + an `int` field on a "
+    "dataclass, with backward-compatible default → 0.65 (small feature, "
+    "one open question on existing-data migration).\n"
+    "  • Adding MD5 password hashing or plaintext token storage → 0.35 "
+    "(security-critical, must escalate).\n\n"
+    "Pick the band you literally fall into; do not subtract a buffer."
+)
+
+
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
+            {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
@@ -63,17 +88,19 @@ def node_route(state: ReviewState) -> dict:
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    response = interrupt({
+        "kind": "approval_request",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+    })
+    return {
+        "human_choice": response["choice"],
+        "human_feedback": response.get("feedback"),
+    }
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -133,8 +160,7 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -174,12 +200,10 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        result = app.invoke(Command(resume=answer), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))
